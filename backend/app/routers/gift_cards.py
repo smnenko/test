@@ -1,10 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import NoResultFound
 
-from app.database import get_db
+from app.constants import GiftCardStatus
+from app.database import get_db, get_session
 from app.models import GiftCard
-from app.schemas import GiftCardResponse
+from app.schemas import GiftCardResponse, RedeemRequest
 
 router = APIRouter(prefix="/api/gift-cards", tags=["gift-cards"])
 
@@ -37,14 +41,31 @@ async def get_gift_card(
     return GiftCardResponse.model_validate(card)
 
 
-# TODO: Реализуйте эндпоинт для применения (списания) баланса гифт-карты
-# POST /api/gift-cards/{code}/redeem
-#
-# Входные данные: { "amount": float }
-#
-# Требования:
-# - Проверить что карта существует, активна и не просрочена
-# - Проверить что баланс достаточен
-# - Списать указанную сумму
-# - Вернуть обновленные данные карты
-#
+@router.post("/{code}/redeem", response_model=GiftCardResponse)
+async def redeem_gift_card(code: str, data: RedeemRequest, session: AsyncSession = Depends(get_session)):
+    current_ts = datetime.now()
+
+    try:
+        gift_card = (
+            await session.execute(
+                select(GiftCard)
+                .where(
+                    GiftCard.code == code,
+                    GiftCard.status == GiftCardStatus.ACTIVE.value,
+                    GiftCard.expires_at > current_ts
+                )
+                .with_for_update()
+            )
+        ).scalar_one()
+    except NoResultFound:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Действующая гифт-карта не найдена')
+
+    if gift_card.balance < data.amount:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Недостаточно средств на гифт-карте')
+
+    gift_card.balance -= data.amount
+    gift_card.status = gift_card.status if gift_card.balance > 0 else GiftCardStatus.REDEEMED.value
+    gift_card.updated_at = current_ts
+
+    await session.commit()
+    return GiftCardResponse.model_validate(gift_card)
